@@ -19,8 +19,6 @@ v4 CHANGELOG — review-driven sampling, multi-task, ensemble UQ, metrics
             anticipation loss; stronger derivative/DTW/peak-magnitude terms.
   • v6    — Ordinal cumulative severity head P(>4,6,8,9); continuous stage L1
             weights; moderated tail alphas; reduced flood oversampling.
-  • v6b   — EXCLUDE_TEST_YEARS for CV; RUN_FORWARD_EVAL for scoring a future
-            calendar year with a model trained on all prior years.
   • UQ    — Deep ensemble (5 members) as primary UQ; MC-Dropout retained
             for calibration comparison (PICP_flood publishable finding).
   • FEATS — Storm age, rainfall centroid, dynamic hw70→US-1 xcorr travel time.
@@ -367,7 +365,7 @@ OUTPUT_STEPS = len(FORECAST_HORIZONS_MIN)           # = 6
 
 # ── Study period ──────────────────────────────────────────────────────────────
 START_DATE = "2020-01-01"
-END_DATE   = "2025-10-01"   # primary study / training span (through 2025)
+END_DATE   = "2025-10-01"
 
 # ── USGS site identifiers ─────────────────────────────────────────────────────
 # Verified against USGS NWIS monitoring pages.
@@ -493,7 +491,7 @@ FEATURE_PRUNING_MIN_KEEP = 30   # safety floor — never prune below this count
 # (F) Model checkpointing — skip re-training when saved weights are valid.
 SAVE_TRAINED_MODELS = True     # persist weights + scaler after each training run
 USE_MODEL_CACHE     = True     # load from disk when a matching checkpoint exists
-FORCE_RETRAIN       = False     # True → ignore cache and retrain everything
+FORCE_RETRAIN       = False    # True → ignore cache and retrain everything
 
 # =============================================================================
 # CONFIGURATION — v2 IMPROVEMENTS (delayed-peak / phase-lag mitigation)
@@ -533,25 +531,8 @@ CV_VAL_FRACTION       = 0.15    # last 15% of each fold's train block -> validat
 # target (shifted forward by up to +180 min) leaks into the held-out test year.
 CV_EMBARGO_STEPS      = max(FORECAST_HORIZONS_STEPS)   # = 36 steps (180 min)
 # Fold used for the detailed publication figures (storm panels, saliency, etc.).
-# -1 = last remaining fold after EXCLUDE_TEST_YEARS is applied.
+# -1 = last fold (largest train block, train 2020-2024 -> test 2025).
 SHOWCASE_FOLD_INDEX   = -1
-
-# Drop these calendar years from rolling-origin TEST folds (train blocks unchanged
-# for remaining folds). Example: [2025] → CV tests 2022–2024 only; 2025 data may
-# still be in the dataset for forward-evaluation training.
-EXCLUDE_TEST_YEARS    = []
-
-# ── Forward evaluation: train on all years before FORWARD_EVAL_YEAR, score that year
-# Set RUN_FORWARD_EVAL=True to score 2026 (or any future year) after extending the
-# download through FORWARD_EVAL_END_DATE. Requires a one-time train → lstm_forward
-# checkpoint (or set FORWARD_FORCE_RETRAIN=True). This is NOT the same as reusing
-# lstm_fold4 (fold 4 trains only through 2024 and tests 2025).
-RUN_FORWARD_EVAL        = True
-FORWARD_EVAL_YEAR       = 2026
-FORWARD_EVAL_END_DATE   = "2026-10-01"   # USGS download span for forward year
-FORWARD_CHECKPOINT_TAG  = "lstm_forward"
-FORWARD_FORCE_RETRAIN   = False          # load lstm_forward if fingerprint matches
-SKIP_ROLLING_CV         = True          # True → only forward eval, skip CV loop
 
 # (B) Demote the Transformer to an optional baseline. The data has short memory
 #     (<=2 h), so self-attention's long-range strength is wasted and it
@@ -689,15 +670,7 @@ CHECKPOINT_DIR         = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 SAVE_PREPROCESSED      = True    # write raw + engineered features before training
 
-
-def _data_end_date() -> str:
-    """Download/engineer features through END_DATE, extended for forward eval."""
-    end = pd.Timestamp(END_DATE)
-    if RUN_FORWARD_EVAL and FORWARD_EVAL_END_DATE:
-        end = max(end, pd.Timestamp(FORWARD_EVAL_END_DATE))
-    return end.strftime("%Y-%m-%d")
-
-USE_PREPROCESSED_CACHE = True   # if True, load cached features when END_DATE matches
+USE_PREPROCESSED_CACHE = False   # if True, load cached features instead of re-downloading
 
 print("=" * 70)
 print("  CRABTREE CREEK FLASH FLOOD FORECASTING FRAMEWORK")
@@ -706,13 +679,7 @@ print(f"  Device       : {DEVICE}")
 print(f"  Lookback     : {LOOKBACK_MIN} min  ({LOOKBACK_STEPS} steps)")
 print(f"  Horizons     : {FORECAST_HORIZONS_MIN} min")
 print(f"  Output steps : {OUTPUT_STEPS}")
-print(f"  Study period : {START_DATE} → {_data_end_date()}"
-      f"{' (END_DATE=' + END_DATE + ')' if _data_end_date() != END_DATE else ''}")
-if EXCLUDE_TEST_YEARS:
-    print(f"  CV exclude   : test years {EXCLUDE_TEST_YEARS}")
-if RUN_FORWARD_EVAL:
-    print(f"  Forward eval : year {FORWARD_EVAL_YEAR}  "
-          f"(checkpoint={FORWARD_CHECKPOINT_TAG})")
+print(f"  Study period : {START_DATE} → {END_DATE}")
 print(f"  Output dir   : {OUTPUT_DIR.resolve()}/")
 print(f"  Model cache  : {'ON' if USE_MODEL_CACHE else 'OFF'}"
       f"{' (FORCE_RETRAIN)' if FORCE_RETRAIN else ''}"
@@ -816,7 +783,6 @@ def save_preprocessed_data(df_raw, df_feat, feat_cols, target_cols,
                          f"({len(d)} rows)")
         lines.append(f"Features: {len(feat_cols)} | Targets: {len(target_cols)}")
         (PREPROCESSED_DIR / "07_split_summary.txt").write_text("\n".join(lines))
-    (PREPROCESSED_DIR / "data_end_date.txt").write_text(_data_end_date())
     print(f"  Saved preprocessed data -> {PREPROCESSED_DIR}/ "
           f"(raw, {len(feat_cols)}-feature matrix, split summary)")
 
@@ -847,7 +813,7 @@ def build_raw_dataframe() -> pd.DataFrame:
     print("=== Downloading USGS NWIS data ===")
 
     # Uniform 5-minute reference index for resampling
-    ref_idx = pd.date_range(START_DATE, _data_end_date(), freq="5min")
+    ref_idx = pd.date_range(START_DATE, END_DATE, freq="5min")
     series_dict = {}
 
     # ── Precipitation stations ─────────────────────────────────────────────
@@ -855,7 +821,7 @@ def build_raw_dataframe() -> pd.DataFrame:
                     "old_wf": USGS_SITES["old_wf"]}
     for alias, site_id in precip_sites.items():
         print(f"  Downloading precip @ {alias} ({site_id}) ...")
-        df = download_usgs_5min(site_id, ["00045"], START_DATE, _data_end_date())
+        df = download_usgs_5min(site_id, ["00045"], START_DATE, END_DATE)
         if not df.empty:
             col = df.columns[0]
             s   = (df[col]
@@ -870,7 +836,7 @@ def build_raw_dataframe() -> pd.DataFrame:
     gauge_sites = {k: v for k, v in USGS_SITES.items()}
     for alias, site_id in gauge_sites.items():
         print(f"  Downloading gage height @ {alias} ({site_id}) ...")
-        df = download_usgs_5min(site_id, ["00065"], START_DATE, _data_end_date())
+        df = download_usgs_5min(site_id, ["00065"], START_DATE, END_DATE)
         if not df.empty:
             col = df.columns[0]
             s   = (df[col]
@@ -883,7 +849,7 @@ def build_raw_dataframe() -> pd.DataFrame:
                        "ebenezer": USGS_SITES["ebenezer"]}
     for alias, site_id in discharge_sites.items():
         print(f"  Downloading discharge @ {alias} ({site_id}) ...")
-        df = download_usgs_5min(site_id, ["00060"], START_DATE, _data_end_date())
+        df = download_usgs_5min(site_id, ["00060"], START_DATE, END_DATE)
         if not df.empty:
             col = df.columns[0]
             s   = (df[col]
@@ -925,7 +891,7 @@ def _build_synthetic_dataframe() -> pd.DataFrame:
     pd.DataFrame matching the schema of build_raw_dataframe().
     """
     print("  Generating synthetic Crabtree Creek data ...")
-    idx = pd.date_range(START_DATE, _data_end_date(), freq="5min")
+    idx = pd.date_range(START_DATE, END_DATE, freq="5min")
     n   = len(idx)
     rng = np.random.default_rng(GLOBAL_SEED)
 
@@ -1446,8 +1412,7 @@ def chronological_split(df: pd.DataFrame):
 # purged walk-forward split for autocorrelated 5-min data.
 # =============================================================================
 
-def rolling_origin_folds(df: pd.DataFrame,
-                         exclude_test_years: list = None):
+def rolling_origin_folds(df: pd.DataFrame):
     """
     Yield expanding-window folds split by year.
 
@@ -1460,17 +1425,12 @@ def rolling_origin_folds(df: pd.DataFrame,
       validation set for early stopping.
     - CV_EMBARGO_STEPS rows are dropped at the train/val and val/test joins so
       no forward-shifted target leaks across a boundary.
-    - exclude_test_years: calendar years omitted from held-out test (e.g. [2025]).
     """
     years = sorted(df.index.year.unique())
     emb   = CV_EMBARGO_STEPS
-    exclude = set(exclude_test_years if exclude_test_years is not None
-                  else EXCLUDE_TEST_YEARS or [])
     folds = []
     for i in range(CV_MIN_TRAIN_YEARS, len(years)):
         test_year  = years[i]
-        if test_year in exclude:
-            continue
         train_years = years[:i]
         df_train_full = df[df.index.year.isin(train_years)]
         df_test       = df[df.index.year == test_year]
@@ -1496,8 +1456,6 @@ def rolling_origin_folds(df: pd.DataFrame,
 
     print("=== Rolling-origin (expanding-window) cross-validation ===")
     print(f"  Embargo: {emb} steps ({emb*TIMESTEP_MIN} min) at every split boundary")
-    if exclude:
-        print(f"  Excluded test years: {sorted(exclude)}")
     for f in folds:
         print(f"  Fold {f['fold']}: train {f['df_train'].index[0].date()}–"
               f"{f['df_train'].index[-1].date()} ({len(f['df_train']):,}) | "
@@ -5653,111 +5611,6 @@ def _flood_threshold(df_part, target_cols):
     return SIGNIFICANT_STAGE_FT
 
 
-def build_forward_eval_split(df          : pd.DataFrame,
-                             eval_year   : int,
-                             val_fraction: float = CV_VAL_FRACTION,
-                             embargo     : int = CV_EMBARGO_STEPS):
-    """
-    Train/val/test split for forward evaluation on a future calendar year.
-
-    Train = all timesteps with year < eval_year (e.g. 2020–2025 for eval 2026).
-    Test  = eval_year only. Validation carved from the tail of the train block.
-    """
-    df_train_full = df[df.index.year < eval_year]
-    df_test       = df[df.index.year == eval_year]
-    if len(df_train_full) < (LOOKBACK_STEPS + embargo + 100):
-        raise ValueError(f"Insufficient training data before {eval_year}.")
-    if len(df_test) < (LOOKBACK_STEPS + 50):
-        raise ValueError(
-            f"No usable test rows for {eval_year}. "
-            f"Extend FORWARD_EVAL_END_DATE / re-download USGS data.")
-
-    n_tr_full = len(df_train_full)
-    n_val     = max(1, int(n_tr_full * val_fraction))
-    split_pt  = n_tr_full - n_val
-    df_train  = df_train_full.iloc[: max(0, split_pt - embargo)]
-    df_val    = df_train_full.iloc[split_pt:]
-    df_train  = df_train.iloc[: len(df_train) - embargo] if len(df_train) > embargo else df_train
-
-    train_years = sorted(df_train_full.index.year.unique())
-    print("=== Forward-evaluation split ===")
-    print(f"  Train years : {train_years[0]}–{train_years[-1]}  "
-          f"({len(df_train):,} train / {len(df_val):,} val rows)")
-    print(f"  Test year   : {eval_year}  ({len(df_test):,} rows)")
-    return df_train, df_val, df_test
-
-
-def run_forward_eval_year(df_feat     : pd.DataFrame,
-                          feat_cols   : list,
-                          target_cols : list,
-                          eval_year   : int = None):
-    """
-    Train (or load) lstm_forward on all years before eval_year; score eval_year.
-
-    Use this for operational-style evaluation: model trained on 2020–2025,
-    tested on 2026 once USGS data exist. Outputs → OUTPUT_DIR/forward_eval_{year}/.
-    """
-    eval_year = eval_year or FORWARD_EVAL_YEAR
-    out_dir   = OUTPUT_DIR / f"forward_eval_{eval_year}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("\n" + "=" * 70)
-    print(f"  FORWARD EVALUATION — TEST YEAR {eval_year}")
-    print("=" * 70)
-
-    df_tr, df_va, df_te = build_forward_eval_split(df_feat, eval_year)
-    thresholds = build_stage_thresholds(df_tr, target_cols)
-    flood_thr  = thresholds.significant_ft
-    print_stage_threshold_diagnostics(df_tr, thresholds, label="forward train")
-
-    tag = FORWARD_CHECKPOINT_TAG
-    global FORCE_RETRAIN
-    saved_force = FORCE_RETRAIN
-    if FORWARD_FORCE_RETRAIN:
-        FORCE_RETRAIN = False
-    use_cache = USE_MODEL_CACHE and not FORWARD_FORCE_RETRAIN
-
-    try:
-        model, scaler, tr_losses, va_losses = train_final_model(
-            HydroLSTM, LSTM_BEST_PARAMS, df_tr, df_va, feat_cols, target_cols,
-            thresholds, f"LSTM-forward-{eval_year}",
-            checkpoint_tag=tag, use_cache=use_cache)
-    finally:
-        FORCE_RETRAIN = saved_force
-
-    pred_te = predict_continuous(model, scaler, df_te, feat_cols, target_cols)
-    obs_te  = get_obs_dataframe(df_te, target_cols)
-    metrics = compute_all_horizon_metrics(obs_te, pred_te, flood_thr,
-                                          thresholds.extreme_ft)
-    event   = compute_event_skill_table(obs_te, pred_te, flood_thr)
-
-    metrics.to_csv(out_dir / "per_horizon_metrics.csv")
-    event.to_csv(out_dir / "event_skill_lstm.csv")
-    pred_te.to_csv(out_dir / "predictions.csv")
-    obs_te.to_csv(out_dir / "observations.csv")
-
-    print(f"\n  Forward eval @ t+150:")
-    if "t+150min" in metrics.index:
-        r = metrics.loc["t+150min"]
-        print(f"    NSE={r['NSE']}  NSE_flood={r.get('NSE_flood')}  "
-              f"Peak_RMSE={r.get('Peak_RMSE')}  Timing={r.get('Timing_min')} min")
-    if 150 in event.index:
-        e = event.loc[150]
-        print(f"    CSI@9ft={e.get('CSI')}  POD={e.get('POD')}  "
-              f"n_events={e.get('n_events')}")
-
-    _detailed_outputs(
-        [model], scaler, tr_losses, va_losses,
-        None, None, [], [],
-        df_tr, df_te, feat_cols, target_cols, flood_thr,
-        tag=f"forward eval {eval_year}")
-
-    # Move/copy key figures into forward_eval subfolder (plots already in OUTPUT_DIR)
-    print(f"\n  Forward-eval tables → {out_dir.resolve()}/")
-    print(f"  Figures (latest)    → {OUTPUT_DIR.resolve()}/")
-    return {"metrics": metrics, "event": event, "model": model, "scaler": scaler}
-
-
 def plot_cv_fold_skill(per_fold: dict, flood_thr: float):
     """
     v3 headline figure: forecast skill across rolling-origin folds.
@@ -5966,22 +5819,14 @@ def main():
     print("  STEP 1 — DATA LOADING")
     print("=" * 70)
     cache_feats = PREPROCESSED_DIR / "02_features_full.csv"
-    cache_end   = PREPROCESSED_DIR / "data_end_date.txt"
     df_raw = None
-    cache_ok = (USE_PREPROCESSED_CACHE and cache_feats.exists()
-                and cache_end.exists()
-                and cache_end.read_text().strip() == _data_end_date())
-    if cache_ok:
+    if USE_PREPROCESSED_CACHE and cache_feats.exists():
         print(f"  Loading cached preprocessed features: {cache_feats}")
-        print(f"  (data_end_date={cache_end.read_text().strip()})")
         df_feat = pd.read_csv(cache_feats, index_col=0, parse_dates=[0])
         feat_cols = [c for c in (PREPROCESSED_DIR / "06_feature_list.txt")
                      .read_text().splitlines() if c]
         target_cols = [f"t+{h}min" for h in FORECAST_HORIZONS_MIN]
     else:
-        if USE_PREPROCESSED_CACHE and cache_feats.exists():
-            print(f"  [INFO] Preprocessed cache stale (need {_data_end_date()}) "
-                  f"— rebuilding features.")
         df_raw = build_raw_dataframe()
 
         # Optional: future-forcing ablation (perfect-prog / QPF / past-only).
@@ -6013,16 +5858,6 @@ def main():
     print(f"\n  Feature count : {len(feat_cols)}")
     print(f"  Lookback      : {LOOKBACK_MIN} min ({LOOKBACK_STEPS} steps)")
     print(f"  LSTM params   : {LSTM_BEST_PARAMS}")
-
-    # ── Optional forward evaluation (e.g. train 2020–2025 → test 2026) ───────
-    forward_result = None
-    if RUN_FORWARD_EVAL:
-        forward_result = run_forward_eval_year(
-            df_feat, feat_cols, target_cols, FORWARD_EVAL_YEAR)
-        if SKIP_ROLLING_CV:
-            print("\n  ALL STEPS COMPLETE (forward eval only)")
-            print(f"  Results saved to: {OUTPUT_DIR.resolve()}/")
-            return {"forward_eval": forward_result}
 
     # =====================================================================
     # EVALUATION
@@ -6217,13 +6052,8 @@ def main():
     print("\n" + "=" * 70)
     print("  ALL STEPS COMPLETE")
     print(f"  Results saved to: {OUTPUT_DIR.resolve()}/")
-    if forward_result is not None:
-        print(f"  Forward eval   : {OUTPUT_DIR / f'forward_eval_{FORWARD_EVAL_YEAR}'}/")
     print("=" * 70)
-    out = {"per_fold": per_fold, "aggregate": agg_df}
-    if forward_result is not None:
-        out["forward_eval"] = forward_result
-    return out
+    return {"per_fold": per_fold, "aggregate": agg_df}
 
 
 
